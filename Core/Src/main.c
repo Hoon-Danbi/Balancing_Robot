@@ -44,18 +44,23 @@
 
 /* Private variables ---------------------------------------------------------*/
 I2C_HandleTypeDef hi2c1;
+DMA_HandleTypeDef hdma_i2c1_rx;
 
 /* USER CODE BEGIN PV */
 #define MPU6050_ADDR 0xD0 // 0x68 << 1
-uint8_t data[14];
+uint8_t mpu_data[14];
 int16_t Accel_X_RAW,Accel_Y_RAW,Accel_Z_RAW;
+int16_t mpu_temp;
 int16_t Gyro_X_RAW,Gyro_Y_RAW,Gyro_Z_RAW;
 float Ax, Ay, Az, Gx, Gy, Gz;
+uint8_t mpu_ready_flag = 0;
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
 static void MX_I2C1_Init(void);
 /* USER CODE BEGIN PFP */
 
@@ -99,51 +104,43 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_USB_DEVICE_Init();
   MX_I2C1_Init();
   /* USER CODE BEGIN 2 */
-//  int count =0;
-//  float temp=25.5f;
-//
-  /*
-   mpu6050 code
-   */
-  uint8_t check,data_init;
-  // 센서 연결 확인(who am i resister)
-  HAL_I2C_Mem_Read(&hi2c1, MPU6050_ADDR, 0x75, 1, &check, 1, 100);
+  uint8_t temp = 0x00;
+  printf("set mpu6050 dma\n");
+  HAL_I2C_Mem_Write(&hi2c1, MPU6050_ADDR, 0x6B, 1, &temp, 1, 100);
+  HAL_Delay(100);
 
-  if(check ==0x68){
-	  data_init=0;
-	  HAL_I2C_Mem_Write(&hi2c1, MPU6050_ADDR, 0x6B, 1, &data_init, 1, 100);
-	  printf("MPU6050 Initialized Success!\r\n");
-  }
-  else{
-	  printf("MPU6050 Connection Failed... (ID: 0x%02X)\r\n", check);
-  }
-
+  // 2. 첫 번째 DMA 수신 시작
+  printf("first mpu6050 data\n");
+  HAL_I2C_Mem_Read_DMA(&hi2c1, MPU6050_ADDR, 0x3B, 1, mpu_data, 14);
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-	  // 0x3B(Accel_Xout_H)부터 14바이트를 한 번에 읽음 (가속도, 온도, 자이로)
-	      HAL_I2C_Mem_Read(&hi2c1, MPU6050_ADDR, 0x3B, 1, data, 14, 100);
+	  if(mpu_ready_flag){
+		  mpu_ready_flag = 0;
 
-	      // 가속도 가공
-	      Accel_X_RAW = (int16_t)(data[0] << 8 | data[1]);
-	      Accel_Y_RAW = (int16_t)(data[2] << 8 | data[3]);
-	      Accel_Z_RAW = (int16_t)(data[4] << 8 | data[5]);
+		  // 데이터 변환 (물리량 계산)
+		  Ax = (int16_t)(mpu_data[0] << 8 | mpu_data[1]) / 16384.0;
+		  Ay = (int16_t)(mpu_data[2] << 8 | mpu_data[3]) / 16384.0;
+		  Az = (int16_t)(mpu_data[4] << 8 | mpu_data[5]) / 16384.0;
+		  Gx = (int16_t)(mpu_data[8] << 8 | mpu_data[9]) / 131.0;
+		  Gy = (int16_t)(mpu_data[10] << 8 | mpu_data[11]) / 131.0;
+		  Gz = (int16_t)(mpu_data[12] << 8 | mpu_data[13]) / 131.0;
 
-	      // +/- 2g 설정 기준 (16384.0f로 나눔)
-	      Ax = Accel_X_RAW / 16384.0f;
-	      Ay = Accel_Y_RAW / 16384.0f;
-	      Az = Accel_Z_RAW / 16384.0f;
+		  // 출력 (USB CDC 사용)
+		  printf("Ax: %.2f, Ay: %.2f, Az: %.2f | Gx: %.2f, Gy: %.2f, Gz: %.2f\r\n", Ax, Ay, Az, Gx, Gy, Gz);
 
-	      // printf로 결과 출력
-	      printf("Accel: X:%.2f  Y:%.2f  Z:%.2f\r\n", Ax, Ay, Az);
+		  // 3. 다음 데이터를 읽기 위해 다시 호출 (Normal 모드 핵심)
+		  HAL_Delay(100); // 센서 출력 속도 조절 (너무 빠르면 USB가 끊김)
 
-	      HAL_Delay(200);
+	  }
+	HAL_Delay(100);
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -231,6 +228,22 @@ static void MX_I2C1_Init(void)
 }
 
 /**
+  * Enable DMA controller clock
+  */
+static void MX_DMA_Init(void)
+{
+
+  /* DMA controller clock enable */
+  __HAL_RCC_DMA1_CLK_ENABLE();
+
+  /* DMA interrupt init */
+  /* DMA1_Stream0_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Stream0_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Stream0_IRQn);
+
+}
+
+/**
   * @brief GPIO Initialization Function
   * @param None
   * @retval None
@@ -264,6 +277,18 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+void HAL_I2C_MemRxCpltCallback(I2C_HandleTypeDef *hi2c)
+{
+	if(hi2c->Instance == I2C1){
+		mpu_ready_flag=1;
+		HAL_I2C_Mem_Read_DMA(&hi2c1, MPU6050_ADDR, 0x3B, 1, mpu_data, 14);
+	}
+
+
+  /* NOTE : This function should not be modified, when the callback is needed,
+            the HAL_I2C_MemRxCpltCallback could be implemented in the user file
+   */
+}
 
 /* USER CODE END 4 */
 
